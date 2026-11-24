@@ -1,6 +1,8 @@
 import bs4
+import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
+from pandas.tseries.offsets import Tick
 
 
 def _extract_timeseries(xml_text):
@@ -85,6 +87,36 @@ def _parse_datetimeindex(soup, tz=None):
     return index
 
 
+def _parse_points(period, start, delta, label, to_float):
+    """Parse the points of one period into a Series indexed by timestamp.
+
+    Looks up all positions and values of the period once instead of searching inside every point.
+    Falls back to the per-point search when a point lacks a position or a value.
+    """
+    points = period.find_all('point')
+    positions = period.find_all('position')
+    values = period.find_all(label)
+    if len(positions) == len(points) == len(values):
+        positions = [p.text for p in positions]
+        values = [v.text for v in values]
+    else:
+        positions, values = [], []
+        for point in points:
+            positions.append(point.find('position').text)
+            values.append(point.find(label).text)
+    if to_float:
+        positions = [p.replace(',', '') for p in positions]
+        values = [v.replace(',', '') for v in values]
+    positions = np.array(positions, dtype=int)
+    if isinstance(delta, Tick):
+        index = (start + pd.to_timedelta((positions - 1) * delta.nanos, unit='ns')).as_unit(start.unit)
+    else:
+        index = [start + (int(p) - 1) * delta for p in positions]
+    series = pd.Series(values, index=index)
+    # a repeated position keeps its last value, as the previous dict-based parsing did
+    return series[~series.index.duplicated(keep='last')]
+
+
 def _parse_timeseries_generic(soup, label='quantity', to_float=True, merge_series=False, period_name='period'):
     series = {
         '15min': [],
@@ -93,20 +125,12 @@ def _parse_timeseries_generic(soup, label='quantity', to_float=True, merge_serie
     }
 
     for period in soup.find_all(period_name):
-        data = {}
         start = pd.Timestamp(period.find('start').text)
         end = pd.Timestamp(period.find('end').text)
         delta_text = _resolution_to_timedelta(res_text=period.find('resolution').text)
         delta = to_offset(delta_text)
-        for point in period.find_all('point'):
-            position = point.find('position').text
-            value = point.find(label).text
-            if to_float:
-                position = position.replace(',', '')
-                value = value.replace(',', '')
-            position = int(position)
-            data[start + (position-1)*delta] = value
-        S = pd.Series(data).sort_index()
+        S = _parse_points(period, start, delta, label, to_float)
+        S = S.sort_index()
         if soup.find('curvetype').text == 'A03':
             # with A03 its possible that positions are missing, this is when values are repeated
             # see docs: https://eepublicdownloads.entsoe.eu/clean-documents/EDI/Library/cim_based/Introduction_of_different_Timeseries_possibilities__curvetypes__with_ENTSO-E_electronic_document_v1.4.pdf
